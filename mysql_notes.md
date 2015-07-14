@@ -241,7 +241,7 @@ InnoDB只聚集在同一个页面中的记录，包含相邻键值的页面可�
 
 最好避免随机的(不连续且值的分布范围非常大)聚簇索引，特别是对于I/O密集型的应用。例如，从性能角度考虑，用UUID来作为聚簇索引则会特别糟糕：使得聚簇索引的插入变得完全随机，这是最坏的情况，使得数据没有任何聚集特性。
 
-**Tip**
+**Tips**
 
 顺序的主键什么时候回造成更坏的结果？  
 答： 对于高并发工作负载，在InnoDB中按主键顺序插入可能会造成明显的竞争。主键的上界会成为*热点*，因为所有的插入都发生在这里，所以并发插入可能导致间隙锁竞争。另一个热点可能是*AUTO_INCREMENT*锁机制，如果遇到这个问题可能需要重新设计表或者应用。
@@ -446,6 +446,163 @@ mysql> SELECT * FROM post WHERE post.id IN (123, 456, 567, 9098);
 
 MySQL对任何关联操作都执行**嵌套循环关联**操作，即MySQL先在一个表中循环取出单条数据，然后再嵌套循环到下一个表中寻找匹配的行，依次下去，直到找到的表中匹配的行为止。
 ![图5](http://img4.imgtn.bdimg.com/it/u=1049569300,194552430&fm=15&gp=0.jpg "泳道图")
+
+
+## 6.5 MySQL查询优化器的局限
+
+### 6.5.1 关联子查询
+
+**MySQL的子查询实现的非常糟糕！**
+
+**最糟糕的一类查询是WHERE条件中包含IN()的子查询。**
+
+```
+mysql> SELECT * FROM sakila.film
+    -> WHERE film_id IN (
+    ->     SELECT film_id FROM skill.film_actor WHERE actor_id = 1);
+```
+以为是这样查询:
+
+```
+-- SELECT GROUP_CONCAT(film_id) FROM sakila.film_actor WHRE actor_id = 1;
+-- Result: 1, 23, 25, 140, 166, 277, 361, 438
+SELECT * FROM skill.film 
+WHERE film_id 
+IN (1, 23, 25, 148, 166, 277, 361, 438);
+```
+实际上MySQL不是这样做的，它会将外层表压到子查询中，它认为这样可以更高效率的查找的数据行。即，MySQL真正会执行下面的查询：
+
+```
+SELECT * FROM sakila.film
+WHERE EXISTS (
+    SELECT * FROM sakila.film_actor WHERE actor_id = 1
+    AND film_actor.film_id = film.film_id);
+```
+
+**优化方法**:
+
+* 用INNER JOIN改写
+
+```
+mysql> SELECT * FROM sakila.film
+    ->     INNER JOIN sakila.film_actor USING (film_id)
+    -> WHERE actor_id = 1;
+```
+
+* 用GROUP_CONCAT()再IN()中构造一个由逗号分割的列表，这个通常比内部关联更快
+
+**Tips**
+
+关联子查询不一定性能就一定差，需要跟进需求和试验来确定是否使用关联子查询。
+
+
+### 6.5.2 UNION的限制
+
+如果希望UNION各个子句能够根据LIMIT只取部分结果集，或者希望先排好序再合并结果集的话，**就需要在UNION各个子句中分别使用LIMIT**。例如，下面的例子MySQL会将两张表都存放在一个临时表中，然后再取出前20行。
+
+```
+(SELECT first_name, last_name FROM sakila.actor ORDER BY last_name)
+UNION ALL 
+(SELECT first_name, last_name FROM skill.customer ORDER BY last_name)
+LIMIT 20;
+```
+可以再每个子句中都加上LIMIT 20限制，减少临时表的数据行。同时因为从临时表中取出的数据顺序可能不一致，所以需要全局的ORDER BY排序。
+
+```
+(SELECT first_name, last_name FROM sakila.actor
+    ORDER BY last_name LIMIT 20)
+UNION ALL 
+(SELECT first_name, last_name FROM skill.customer
+    ORDER BY last_name LIMIT 20)
+LIMIT 20;
+```
+### 6.5.8 最大值最小值优化
+
+MySQL对MAX()和MIN()查询优化并不好，如果查询条件没有被索引，需要做一次全表扫描。
+
+```
+mysql> SELECT MIN(actor_id) FROM sakila.actor WHERE first_name = "PENELOPE";
+```
+曲线办法可以移除MIN()改用LIMIT 1限制。
+
+```
+mysql> SELECT actor_id FROM sakila.actor USE INDEX(PRIMARY) 
+    -> WHERE first_name = "PENELOPE" LIMIT 1;
+```
+
+### 6.5.9 在同一个表上查询和更新
+
+**MySQL不允许对同一张表同时进行查询和更新！**
+
+### 6.7.1 优化关联查询
+
+* 确保ON或者USING子句中的列上有索引
+* 确保任何的GROUP BY和ORDER BY中的表达式只涉及到一个表中的列，这样MySQL才有可能使用索引来优化
+* 当升级MySQL的时候要注意：关联语法、运算符优先级等其他可能会发生变化的地方
+
+
+
+# 第七章 MySQL高级特性
+
+## 7.1 分区表
+
+对用户来说，分区表是一个独立的**逻辑表**， 但是底层由多个物理子表组成。
+
+实现分区的代码实际上是对一组底层表的句柄对象(Handler Object)的封装。对分区表的请求都会通过句柄对象转化成对存储引擎接口的调用。  
+
+因此，分区对于SQL层来说是一个完全封装底层实现的黑盒，对应用是透明的。 
+
+由于MySQL分区表的实现是对底层物理表的封装，从而决定索引也是按照分区的子表定义的，**没有全局索引！**
+
+MySQL在创建表时使用**PARTITION BY**子句定义每个分区存放数据。在执行查询的时候优化器会根据分区定义过滤掉没有所需数据的分区，这样查询就无须扫描所有分区了。
+
+**分区表的好处:**
+
+* 表太大，无法放入内存或者只在表尾部有热点数据，其他全是历史数据
+* 便于维护
+* 将数据分布在不同的设备上
+* 用于避免某些特殊瓶颈，例如InnoDB的单个索引的互斥访问，ext3文件系统的inode锁竞争等
+* 可以独立备份、恢复分区，大数据量的使用场景下效果比较好
+
+**分区表的限制:**
+
+* 一个表最多**1024**个分区
+* 在MySQL5.1中分区表达式必须是整数或者返回值为整数的表达式，MySQL5.5中某些场景可以直接用列进行分区
+* 如果分区字段中有主键或者唯一索引的列， 那么所有主键列和唯一索引列都必须包含进来
+* 分区表中无法使用外键约束
+
+### 7.1.2 分区表的类型
+
+
+MySQL支持多种分区表。  
+
+最多的是根据范围进行分区， 每个分区存储落在某个范围内的记录。  
+
+分区表达式可以是列，也可以是包含列的表达式。例如：
+
+```
+CREATE TABLE sales (
+    order_date DATETIME NOT NULL,
+    -- Other columns omitted
+) ENGINE=InnoDB PARTITION BY RANGE(YEAR(order_date)) (
+    PARTITION p_2010 VALUES LESS THAN (2010),
+    PARTITION p_2011 VALUES LESS THAN (2011),
+    PARTITION p_2012 VALUES LESS THAN (2012),
+    PARTITION p_catchall VALUES LESS THAN MAXVALUE);
+```
+**PARTITION分区子句中可以使用任何函数，但是表达式的返回值必须是一个确定的整数，且不能是常数！**
+
+MySQL还支持键值、哈希和列表分区。
+
+### 7.1.3 如何使用分区表
+
+当数据量非常大时，索引的开销和维护成本会非常大，导致大量的随机I/O，**而且当数据量巨大时，B-Tree索引就无法起作用了，除非使用索引覆盖查询，否则服务器需要根据索引扫描的结果回表查询所有符合条件的记录，如果数据量巨大，会产生大量随机I/O。**  
+
+
+为了保证大数据量的扩展性，一般有下面两个策略：
+
+* 全量扫描数据，不要索引。根据分区规则大致定位所需的数据位置。
+* 索引数据，并分散热点。如果数据产生热点，其它数据很少被访问，可以将这些数据单独放置在一个分区中。
 
 
 
